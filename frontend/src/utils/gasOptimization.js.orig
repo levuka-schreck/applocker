@@ -1,0 +1,179 @@
+/**
+ * Gas Optimization Utilities for Anvil
+ * 
+ * Anvil can have unpredictable gas estimation. These utilities help:
+ * 1. Set reasonable gas limits for common operations
+ * 2. Estimate gas before transactions
+ * 3. Use optimal gas settings
+ */
+
+// Predefined gas limits for common operations
+export const GAS_LIMITS = {
+  // Token operations
+  TOKEN_APPROVE: 50000,
+  TOKEN_TRANSFER: 65000,
+  TOKEN_FAUCET: 100000,
+  
+  // Vault operations  
+  VAULT_DEPOSIT: 200000,
+  VAULT_REDEEM: 150000,
+  VAULT_STAKE: 180000,
+  VAULT_UNSTAKE: 150000,
+  
+  // Loan operations
+  LOAN_CREATE: 300000,
+  LOAN_REPAY: 250000,
+  
+  // Admin operations
+  APPROVE_BORROWER: 100000,
+  
+  // Default fallback
+  DEFAULT: 200000,
+};
+
+/**
+ * Get optimized transaction options for Anvil
+ * @param {string} operation - Operation type (e.g., 'TOKEN_APPROVE')
+ * @param {object} customOptions - Custom options to override
+ * @returns {object} Transaction options with gas settings
+ */
+export function getGasOptions(operation = 'DEFAULT', customOptions = {}) {
+  const gasLimit = GAS_LIMITS[operation] || GAS_LIMITS.DEFAULT;
+  
+  return {
+    gasLimit,
+    // Anvil doesn't require gas price, but we can set low values
+    maxFeePerGas: 1000000000, // 1 gwei
+    maxPriorityFeePerGas: 1000000000, // 1 gwei
+    ...customOptions,
+  };
+}
+
+/**
+ * Estimate gas for a transaction with fallback
+ * @param {Function} txFunction - Transaction function to estimate
+ * @param {string} fallbackOperation - Fallback operation type for gas limit
+ * @returns {Promise<object>} Gas options
+ */
+export async function estimateGasWithFallback(txFunction, fallbackOperation = 'DEFAULT') {
+  try {
+    // Try to estimate gas
+    const estimatedGas = await txFunction.estimateGas();
+    // Add 20% buffer for safety
+    const gasLimit = Math.floor(Number(estimatedGas) * 1.2);
+    
+    return {
+      gasLimit,
+      maxFeePerGas: 1000000000,
+      maxPriorityFeePerGas: 1000000000,
+    };
+  } catch (error) {
+    console.warn('Gas estimation failed, using preset limit:', error.message);
+    // Fall back to preset limit
+    return getGasOptions(fallbackOperation);
+  }
+}
+
+/**
+ * Execute transaction with optimal gas settings
+ * @param {Function} txFunction - Transaction function
+ * @param {string} operation - Operation type
+ * @param {object} customOptions - Custom options
+ * @returns {Promise<object>} Transaction receipt
+ */
+export async function executeWithOptimalGas(txFunction, operation = 'DEFAULT', customOptions = {}) {
+  try {
+    // Try estimation first
+    const gasOptions = await estimateGasWithFallback(txFunction, operation);
+    
+    // Merge with custom options
+    const finalOptions = { ...gasOptions, ...customOptions };
+    
+    console.log(`⛽ Executing ${operation} with gas limit:`, finalOptions.gasLimit);
+    
+    // Execute transaction
+    const tx = await txFunction(finalOptions);
+    const receipt = await tx.wait();
+    
+    console.log(`✅ ${operation} completed. Gas used:`, receipt.gasUsed.toString());
+    
+    return receipt;
+  } catch (error) {
+    console.error(`❌ ${operation} failed:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Batch multiple transactions with optimized gas
+ * @param {Array<{fn: Function, operation: string}>} transactions
+ * @returns {Promise<Array>} Array of receipts
+ */
+export async function executeBatch(transactions) {
+  const receipts = [];
+  
+  for (const { fn, operation } of transactions) {
+    try {
+      const receipt = await executeWithOptimalGas(fn, operation);
+      receipts.push(receipt);
+    } catch (error) {
+      console.error(`Failed to execute ${operation}:`, error);
+      throw error;
+    }
+  }
+  
+  return receipts;
+}
+
+/**
+ * Helper for token approval with gas optimization
+ */
+export async function approveToken(tokenContract, spender, amount) {
+  return executeWithOptimalGas(
+    (opts) => tokenContract.approve(spender, amount, opts),
+    'TOKEN_APPROVE'
+  );
+}
+
+/**
+ * Helper for vault deposit with gas optimization
+ */
+export async function depositToVault(vaultContract, amount) {
+  return executeWithOptimalGas(
+    (opts) => vaultContract.deposit(amount, opts),
+    'VAULT_DEPOSIT'
+  );
+}
+
+/**
+ * Helper for staking with gas optimization
+ */
+export async function stakeTokens(vaultContract, amount, lockDays) {
+  return executeWithOptimalGas(
+    (opts) => vaultContract.stake(amount, lockDays, opts),
+    'VAULT_STAKE'
+  );
+}
+
+/**
+ * Helper for creating loans with gas optimization
+ */
+export async function createLoan(vaultContract, publisher, principal, termDays, payInAppEx, appexPercentage) {
+  return executeWithOptimalGas(
+    (opts) => vaultContract.createLoan(publisher, principal, termDays, payInAppEx, appexPercentage, opts),
+    'LOAN_CREATE'
+  );
+}
+
+// Export all utilities
+export default {
+  GAS_LIMITS,
+  getGasOptions,
+  estimateGasWithFallback,
+  executeWithOptimalGas,
+  executeBatch,
+  approveToken,
+  depositToVault,
+  stakeTokens,
+  createLoan,
+};
