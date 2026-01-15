@@ -1,0 +1,22 @@
+{
+  "name": "appex-protocol",
+  "version": "1.0.0",
+  "description": "Instant payment infrastructure for publishers powered by liquidity vaults",
+  "scripts": {
+    "install:all": "./install-deps.sh && cd frontend && npm install",
+    "deploy": "./deploy.sh",
+    "dev": "cd frontend && npm run dev",
+    "build": "forge build && cd frontend && npm run build",
+    "test": "forge test",
+    "anvil": "anvil"
+  },
+  "keywords": [
+    "defi",
+    "payments",
+    "liquidity",
+    "ethereum",
+    "solidity"
+  ],
+  "author": "AppEx Protocol",
+  "license": "MIT"
+}
