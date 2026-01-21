@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -84,7 +84,12 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
     event RedemptionRequested(address indexed lp, uint256 amount);
     event Redeemed(address indexed lp, uint256 lpTokens, uint256 usdc);
     event BorrowerApproved(address indexed borrower, uint256 limit);
-    event LoanCreated(uint256 indexed loanId, address indexed borrower, address indexed publisher, uint256 amount);
+    event LoanCreated(
+        uint256 indexed loanId,
+        address indexed borrower,
+        address indexed publisher,
+        uint256 amount
+    );
     event LoanRepaid(uint256 indexed loanId, uint256 principal, uint256 fees);
     event Staked(address indexed lp, uint256 amount, uint256 duration);
     event Unstaked(address indexed lp, uint256 amount);
@@ -96,11 +101,13 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         string memory lpName,
         string memory lpSymbol
     ) Ownable(msg.sender) {
+        require(_usdc != address(0), "Invalid USDC address");
+        require(_appexToken != address(0), "Invalid APPEX address");
         usdc = IERC20(_usdc);
         appexToken = AppExToken(_appexToken);
-        lpToken = new LPToken(lpName, lpSymbol);
-        lpToken.setVault(address(this));
+        lpToken = new LPToken(lpName, lpSymbol, address(this));
         lastNAVUpdate = block.timestamp;
+        lpToken.setVault(address(this));
     }
 
     // ==================== LP Functions ====================
@@ -110,20 +117,21 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
      */
     function deposit(uint256 amount) external nonReentrant {
         require(amount > 0, "Amount must be > 0");
-        
+
         updateNAV();
-        
+
+        totalDeposits += amount;
+
         uint256 lpTokensToMint;
-        if (lpToken.totalSupply() == 0) {
-            // First deposit: convert USDC (6 decimals) to LP tokens (18 decimals)
-            // 1 USDC = 1 LP token, but need to account for decimal difference
-            lpTokensToMint = amount * 10**12; // Convert 6 decimals to 18 decimals
+        uint256 currentSupply = lpToken.totalSupply();
+
+        if (currentSupply == 0) {
+            lpTokensToMint = amount * 10 ** 12;
         } else {
-            lpTokensToMint = (amount * lpToken.totalSupply()) / getNAV();
+            lpTokensToMint = (amount * currentSupply) / getNAV();
         }
 
         usdc.safeTransferFrom(msg.sender, address(this), amount);
-        totalDeposits += amount;
         lpToken.mint(msg.sender, lpTokensToMint);
 
         emit Deposited(msg.sender, amount, lpTokensToMint);
@@ -134,20 +142,23 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
      */
     function requestRedemption(uint256 lpTokenAmount) external nonReentrant {
         require(lpTokenAmount > 0, "Amount must be > 0");
-        require(lpToken.balanceOf(msg.sender) >= lpTokenAmount, "Insufficient LP tokens");
+        require(
+            lpToken.balanceOf(msg.sender) >= lpTokenAmount,
+            "Insufficient LP tokens"
+        );
 
         updateNAV();
 
-        // Transfer LP tokens to vault
-        lpToken.transferFrom(msg.sender, address(this), lpTokenAmount);
-
-        redemptionQueue.push(RedemptionRequest({
-            lp: msg.sender,
-            amount: lpTokenAmount,
-            timestamp: block.timestamp
-        }));
+        redemptionQueue.push(
+            RedemptionRequest({
+                lp: msg.sender,
+                amount: lpTokenAmount,
+                timestamp: block.timestamp
+            })
+        );
 
         totalPendingRedemptions += lpTokenAmount;
+        lpToken.transferFrom(msg.sender, address(this), lpTokenAmount);
 
         emit RedemptionRequested(msg.sender, lpTokenAmount);
     }
@@ -160,29 +171,30 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
 
         uint256 nav = getNAV();
         uint256 availableUSDC = getAvailableUSDC();
-        uint256 dailyCap = (lpToken.totalSupply() * dailyRedemptionCap) / BASIS_POINTS;
+        uint256 currentSupply = lpToken.totalSupply();
+        uint256 dailyCap = (currentSupply * dailyRedemptionCap) / BASIS_POINTS;
         uint256 processedToday = 0;
 
         uint256 i = 0;
         while (i < redemptionQueue.length && processedToday < dailyCap) {
             RedemptionRequest memory request = redemptionQueue[i];
-            uint256 usdcAmount = (request.amount * nav) / lpToken.totalSupply();
+            uint256 usdcAmount = (request.amount * nav) / currentSupply;
 
             if (usdcAmount <= availableUSDC) {
-                // Process redemption
-                lpToken.burn(address(this), request.amount);
-                usdc.safeTransfer(request.lp, usdcAmount);
-                
                 totalDeposits -= usdcAmount;
                 totalPendingRedemptions -= request.amount;
                 availableUSDC -= usdcAmount;
                 processedToday += request.amount;
 
-                emit Redeemed(request.lp, request.amount, usdcAmount);
-
-                // Remove from queue
-                redemptionQueue[i] = redemptionQueue[redemptionQueue.length - 1];
+                redemptionQueue[i] = redemptionQueue[
+                    redemptionQueue.length - 1
+                ];
                 redemptionQueue.pop();
+                
+                lpToken.burn(address(this), request.amount);
+                usdc.safeTransfer(request.lp, usdcAmount);
+
+                emit Redeemed(request.lp, request.amount, usdcAmount);
             } else {
                 i++;
             }
@@ -200,8 +212,9 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         uint256 lpYieldRate,
         uint256 protocolFeeRate
     ) external onlyOwner {
+        require(borrower != address(0), "Invalid borrower address");
         require(!borrowers[borrower].approved, "Already approved");
-        
+
         borrowers[borrower] = Borrower({
             approved: true,
             borrowLimit: limit,
@@ -226,18 +239,23 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         uint256 appexPercentage
     ) external nonReentrant returns (uint256) {
         Borrower storage borrower = borrowers[msg.sender];
+        require(publisher != address(0), "Invalid publisher address");
         require(borrower.approved, "Not approved borrower");
-        require(borrower.currentDebt + principal <= borrower.borrowLimit, "Exceeds limit");
+        require(
+            borrower.currentDebt + principal <= borrower.borrowLimit,
+            "Exceeds limit"
+        );
         require(principal > 0, "Principal must be > 0");
         require(appexPercentage <= 100, "Invalid percentage");
 
         updateNAV();
 
         uint256 lpFee = (principal * borrower.lpYieldRate) / BASIS_POINTS;
-        uint256 protocolFee = (principal * borrower.protocolFeeRate) / BASIS_POINTS;
+        uint256 protocolFee = (principal * borrower.protocolFeeRate) /
+            BASIS_POINTS;
 
         uint256 loanId = nextLoanId++;
-        
+
         loans[loanId] = Loan({
             borrower: msg.sender,
             publisher: publisher,
@@ -266,7 +284,7 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
             if (appexAmount > 0) {
                 // In production, this would buy APPEX from DEX
                 // For demo, direct transfer
-                appexToken.transfer(publisher, appexAmount * 10**12); // Adjust for decimals
+                appexToken.transfer(publisher, appexAmount * 10 ** 12); // Adjust for decimals
             }
         } else {
             usdc.safeTransfer(publisher, principal);
@@ -280,7 +298,10 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
     /**
      * @dev Repay a loan
      */
-    function repayLoan(uint256 loanId, bool payFeeInAppEx) external nonReentrant {
+    function repayLoan(
+        uint256 loanId,
+        bool payFeeInAppEx
+    ) external nonReentrant {
         Loan storage loan = loans[loanId];
         require(!loan.repaid, "Already repaid");
         require(loan.borrower == msg.sender, "Not loan borrower");
@@ -288,21 +309,18 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         updateNAV();
 
         uint256 totalDue = loan.principal + loan.lpFee + loan.protocolFee;
+        uint256 usdcAmount = loan.principal + loan.lpFee;
+        uint256 appexFeeAmount = 0;
 
+        // ✅ Calculate amounts first
         if (payFeeInAppEx) {
-            // 25% discount on protocol fees if paid in APPEX
             uint256 discountedFee = (loan.protocolFee * 75) / 100;
-            uint256 appexFeeAmount = discountedFee * 10**12; // Adjust decimals
-
-            usdc.safeTransferFrom(msg.sender, address(this), loan.principal + loan.lpFee);
-            appexToken.transferFrom(msg.sender, address(this), appexFeeAmount);
-
-            // Distribute APPEX fees to stakers
-            distributeAppExFees(appexFeeAmount);
+            appexFeeAmount = discountedFee * 10 ** 12;
         } else {
-            usdc.safeTransferFrom(msg.sender, address(this), totalDue);
+            usdcAmount = totalDue;
         }
 
+        // ✅ ALL state changes BEFORE any interactions
         loan.repaid = true;
         borrowers[msg.sender].currentDebt -= loan.principal;
         totalLoansOutstanding -= loan.principal;
@@ -317,6 +335,14 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
             }
         }
 
+        // ✅ ALL interactions at the end
+        usdc.safeTransferFrom(msg.sender, address(this), usdcAmount);
+
+        if (payFeeInAppEx) {
+            appexToken.transferFrom(msg.sender, address(this), appexFeeAmount);
+            distributeAppExFees(appexFeeAmount);
+        }
+
         emit LoanRepaid(loanId, loan.principal, loan.lpFee + loan.protocolFee);
     }
 
@@ -326,31 +352,38 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
      * @dev Stake APPEX tokens
      */
     function stake(uint256 amount, uint256 lockDays) external nonReentrant {
-        require(lockDays == 0 || lockDays == 90 || lockDays == 180, "Invalid lock period");
+        require(
+            lockDays == 0 || lockDays == 90 || lockDays == 180,
+            "Invalid lock period"
+        );
         require(amount > 0, "Amount must be > 0");
-        
+
         uint256 lpBalance = lpToken.balanceOf(msg.sender);
         uint256 maxStake = (lpBalance * stakingMultiplier) / 100;
-        
-        StakingPosition storage position = stakingPositions[msg.sender];
-        require(position.appexStaked + amount <= maxStake, "Exceeds staking cap");
 
-        appexToken.transferFrom(msg.sender, address(this), amount);
+        StakingPosition storage position = stakingPositions[msg.sender];
+        require(
+            position.appexStaked + amount <= maxStake,
+            "Exceeds staking cap"
+        );
 
         uint256 multiplier = lockDays == 0 ? 1 : (lockDays == 90 ? 2 : 3);
         uint256 weight = amount * multiplier;
 
         if (position.appexStaked > 0) {
-            // Update existing position
-            totalStakingWeight -= position.appexStaked * getMultiplier(position.lockDuration);
+            totalStakingWeight -=
+                position.appexStaked *
+                getMultiplier(position.lockDuration);
         }
 
         position.appexStaked += amount;
         position.lockDuration = lockDays;
         position.lockEnd = block.timestamp + (lockDays * 1 days);
-        
+
         totalStaked += amount;
         totalStakingWeight += weight;
+
+        appexToken.transferFrom(msg.sender, address(this), amount);
 
         emit Staked(msg.sender, amount, lockDays);
     }
@@ -365,7 +398,7 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
 
         uint256 multiplier = getMultiplier(position.lockDuration);
         totalStakingWeight -= amount * multiplier;
-        
+
         position.appexStaked -= amount;
         totalStaked -= amount;
 
@@ -421,10 +454,13 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         for (uint256 i = 0; i < activeLoans.length; i++) {
             Loan memory loan = loans[activeLoans[i]];
             if (!loan.repaid) {
-                uint256 daysElapsed = (block.timestamp - loan.startTime) / 1 days;
+                uint256 daysElapsed = (block.timestamp - loan.startTime) /
+                    1 days;
                 uint256 maxAccrual = loan.lpFee;
                 uint256 calculatedAccrual = loan.dailyAccrual * daysElapsed;
-                accruedFees += calculatedAccrual > maxAccrual ? maxAccrual : calculatedAccrual;
+                accruedFees += calculatedAccrual > maxAccrual
+                    ? maxAccrual
+                    : calculatedAccrual;
             }
         }
 
@@ -446,38 +482,52 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
     /**
      * @dev Get vault statistics
      */
-    function getVaultStats() external view returns (
-        uint256 nav,
-        uint256 sharePrice,
-        uint256 totalLPs,
-        uint256 availableLiquidity,
-        uint256 utilizationRate,
-        uint256 activeLoansCount
-    ) {
+    function getVaultStats()
+        external
+        view
+        returns (
+            uint256 nav,
+            uint256 sharePrice,
+            uint256 totalLPs,
+            uint256 availableLiquidity,
+            uint256 utilizationRate,
+            uint256 activeLoansCount
+        )
+    {
         nav = getNAV();
         sharePrice = getSharePrice();
         totalLPs = lpToken.totalSupply();
         availableLiquidity = getAvailableUSDC();
-        utilizationRate = nav > 0 ? (totalLoansOutstanding * BASIS_POINTS) / nav : 0;
+        utilizationRate = nav > 0
+            ? (totalLoansOutstanding * BASIS_POINTS) / nav
+            : 0;
         activeLoansCount = activeLoans.length;
     }
 
     /**
      * @dev Get borrower info
      */
-    function getBorrowerInfo(address borrower) external view returns (
-        bool approved,
-        uint256 limit,
-        uint256 currentDebt,
-        uint256 available,
-        uint256 lpYieldRate,
-        uint256 protocolFeeRate
-    ) {
+    function getBorrowerInfo(
+        address borrower
+    )
+        external
+        view
+        returns (
+            bool approved,
+            uint256 limit,
+            uint256 currentDebt,
+            uint256 available,
+            uint256 lpYieldRate,
+            uint256 protocolFeeRate
+        )
+    {
         Borrower memory b = borrowers[borrower];
         approved = b.approved;
         limit = b.borrowLimit;
         currentDebt = b.currentDebt;
-        available = b.borrowLimit > b.currentDebt ? b.borrowLimit - b.currentDebt : 0;
+        available = b.borrowLimit > b.currentDebt
+            ? b.borrowLimit - b.currentDebt
+            : 0;
         lpYieldRate = b.lpYieldRate;
         protocolFeeRate = b.protocolFeeRate;
     }
@@ -485,16 +535,22 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
     /**
      * @dev Get staking info
      */
-    function getStakingInfo(address account) external view returns (
-        uint256 staked,
-        uint256 maxStake,
-        uint256 lockEnd,
-        uint256 multiplier,
-        uint256 pendingRewards
-    ) {
+    function getStakingInfo(
+        address account
+    )
+        external
+        view
+        returns (
+            uint256 staked,
+            uint256 maxStake,
+            uint256 lockEnd,
+            uint256 multiplier,
+            uint256 pendingRewards
+        )
+    {
         StakingPosition memory position = stakingPositions[account];
         uint256 lpBalance = lpToken.balanceOf(account);
-        
+
         staked = position.appexStaked;
         maxStake = (lpBalance * stakingMultiplier) / 100;
         lockEnd = position.lockEnd;
