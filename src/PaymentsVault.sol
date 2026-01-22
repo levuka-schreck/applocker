@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/governance/TimelockController.sol";
 import "./LPToken.sol";
 import "./AppExToken.sol";
 
@@ -14,6 +15,15 @@ import "./AppExToken.sol";
  */
 contract PaymentsVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
+
+    TimelockController public timelock;
+    mapping(address => bool) public governors;
+    uint256 public constant GOVERNOR_THRESHOLD = 2;
+    address[] public governorList;
+    uint256 public nextProposalId = 1;
+
+    mapping(address => bytes32[]) public governorProposals; // Proposals created by each governor
+    mapping(address => uint256) public governorApprovalCount; // Approvals made by each governor
 
     // Tokens
     IERC20 public immutable usdc;
@@ -79,6 +89,18 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
     RedemptionRequest[] public redemptionQueue;
     uint256 public totalPendingRedemptions;
 
+    struct BorrowerProposal {
+        address borrower;
+        uint256 limit;
+        uint256 lpYieldRate;
+        uint256 protocolFeeRate;
+        uint256 approvals;
+        mapping(address => bool) hasApproved;
+        uint256 proposedAt;
+    }
+
+    mapping(bytes32 => BorrowerProposal) public borrowerProposals;
+
     /**
      * @dev Detailed loan information for UI display
      */
@@ -115,6 +137,13 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         uint256 activeLoanCount;
     }
 
+    struct GovernorDetails {
+        address governorAddress;
+        bool isActive;
+        uint256 proposalCount;
+        uint256 approvalCount;
+    }
+
     // Events
     event RedemptionRequested(address indexed lp, uint256 amount);
     event Redeemed(address indexed lp, uint256 lpTokens, uint256 usdc);
@@ -130,6 +159,20 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
     event Unstaked(address indexed lp, uint256 amount);
     event RewardsDistributed(uint256 amount);
     event Deposited(address indexed lp, uint256 amount, uint256 lpTokens);
+    event GovernorAdded(address indexed governor, address indexed addedBy);
+    event GovernorRemoved(address indexed governor, address indexed removedBy);
+    event TimelockSet(address indexed timelock);
+    event BorrowerProposed(bytes32 proposalId, address borrower, uint256 limit);
+    event BorrowerProposalApproved(
+        bytes32 proposalId,
+        address approver,
+        uint256 approvals
+    );
+
+    modifier onlyGovernor() {
+        require(governors[msg.sender], "Caller is not a governor");
+        _;
+    }
 
     constructor(
         address _usdc,
@@ -743,5 +786,233 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
             }
         }
         return count;
+    }
+
+    function proposeBorrower(
+        address borrower,
+        uint256 limit,
+        uint256 lpYieldRate,
+        uint256 protocolFeeRate
+    ) external onlyGovernor returns (bytes32) {
+        require(borrower != address(0), "Invalid borrower address");
+        require(limit > 0, "Limit must be greater than 0");
+        require(!borrowers[borrower].approved, "Borrower already approved");
+
+        // Use a counter-based approach for unique, non-predictable IDs
+        bytes32 proposalId = keccak256(
+            abi.encode(
+                borrower,
+                msg.sender,
+                nextProposalId++,
+                block.timestamp,
+                block.number
+            )
+        );
+
+        require(
+            borrowerProposals[proposalId].borrower == address(0),
+            "Proposal ID collision"
+        );
+        BorrowerProposal storage proposal = borrowerProposals[proposalId];
+
+        proposal.borrower = borrower;
+        proposal.limit = limit;
+        proposal.lpYieldRate = lpYieldRate;
+        proposal.protocolFeeRate = protocolFeeRate;
+        proposal.proposedAt = block.timestamp;
+        proposal.approvals = 1;
+        proposal.hasApproved[msg.sender] = true;
+
+        governorProposals[msg.sender].push(proposalId);
+        governorApprovalCount[msg.sender]++; // Count initial approval
+
+        emit BorrowerProposed(proposalId, borrower, limit);
+
+        return proposalId;
+    }
+
+    function approveBorrowerProposal(bytes32 proposalId) external onlyGovernor {
+        BorrowerProposal storage proposal = borrowerProposals[proposalId];
+        require(!proposal.hasApproved[msg.sender], "Already approved");
+
+        proposal.hasApproved[msg.sender] = true;
+        proposal.approvals++;
+
+        governorApprovalCount[msg.sender]++;
+
+        emit BorrowerProposalApproved(
+            proposalId,
+            msg.sender,
+            proposal.approvals
+        );
+
+        if (proposal.approvals >= GOVERNOR_THRESHOLD) {
+            // Execute after timelock
+            timelock.schedule(
+                address(this),
+                0,
+                abi.encodeWithSelector(
+                    this.approveBorrower.selector,
+                    proposal.borrower,
+                    proposal.limit,
+                    proposal.lpYieldRate,
+                    proposal.protocolFeeRate
+                ),
+                bytes32(0),
+                bytes32(proposalId),
+                2 days // timelock delay
+            );
+        }
+    }
+
+    /**
+     * @dev Add a new governor (only existing governors can add new governors)
+     * @param governor Address to grant governor privileges
+     */
+    function addGovernor(address governor) external onlyGovernor {
+        require(governor != address(0), "Invalid governor address");
+        require(!governors[governor], "Already a governor");
+
+        governors[governor] = true;
+        governorList.push(governor);
+
+        emit GovernorAdded(governor, msg.sender);
+    }
+
+    /**
+     * @dev Remove a governor (only existing governors can remove governors)
+     * @param governor Address to revoke governor privileges from
+     */
+    function removeGovernor(address governor) external onlyGovernor {
+        require(governors[governor], "Not a governor");
+        require(governor != msg.sender, "Cannot remove yourself");
+
+        // Get current count before removal
+        uint256 currentCount = getGovernorCount();
+        require(currentCount > 1, "Cannot remove last governor");
+
+        governors[governor] = false;
+
+        // Remove from governorList array
+        for (uint256 i = 0; i < governorList.length; i++) {
+            if (governorList[i] == governor) {
+                governorList[i] = governorList[governorList.length - 1];
+                governorList.pop();
+                break;
+            }
+        }
+
+        emit GovernorRemoved(governor, msg.sender);
+    }
+
+    /**
+     * @dev Get list of all governors (public view)
+     * @return addresses Array of all governor addresses
+     * @return count Total number of governors
+     */
+    function getListOfGovernors()
+        external
+        view
+        returns (address[] memory addresses, uint256 count)
+    {
+        count = governorList.length;
+        addresses = new address[](count);
+
+        for (uint256 i = 0; i < count; i++) {
+            addresses[i] = governorList[i];
+        }
+    }
+
+    /**
+     * @dev Get detailed information about all governors
+     * @return addresses Array of governor addresses
+     * @return governorDetails Array of detailed governor information
+     * @return count Total number of governors
+     */
+    function getGovernorsDetails()
+        external
+        view
+        returns (
+            address[] memory addresses,
+            GovernorDetails[] memory governorDetails,
+            uint256 count
+        )
+    {
+        count = governorList.length;
+        addresses = new address[](count);
+        governorDetails = new GovernorDetails[](count);
+
+        for (uint256 i = 0; i < count; i++) {
+            address gov = governorList[i];
+            addresses[i] = gov;
+            governorDetails[i] = GovernorDetails({
+                governorAddress: gov,
+                isActive: governors[gov],
+                proposalCount: _countProposalsByGovernor(gov),
+                approvalCount: _countApprovalsByGovernor(gov)
+            });
+        }
+    }
+
+    /**
+     * @dev Check if an address is a governor (public view)
+     * @param account Address to check
+     * @return bool True if the address is a governor
+     */
+    function isGovernor(address account) external view returns (bool) {
+        return governors[account];
+    }
+
+    /**
+     * @dev Get the total count of active governors
+     * @return count Number of active governors
+     */
+    function getGovernorCount() public view returns (uint256) {
+        uint256 count = 0;
+        for (uint256 i = 0; i < governorList.length; i++) {
+            if (governors[governorList[i]]) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * @dev Set the timelock controller (only owner - one-time setup)
+     * @param _timelock Address of the TimelockController contract
+     */
+    function setTimelock(address _timelock) external onlyOwner {
+        require(_timelock != address(0), "Invalid timelock address");
+        require(address(timelock) == address(0), "Timelock already set");
+
+        timelock = TimelockController(payable(_timelock));
+
+        emit TimelockSet(_timelock);
+    }
+
+    /**
+     * @dev Initialize the first governor (only owner, only callable once during setup)
+     * @param initialGovernor Address of the first governor
+     */
+    function initializeGovernor(address initialGovernor) external onlyOwner {
+        require(governorList.length == 0, "Governors already initialized");
+        require(initialGovernor != address(0), "Invalid governor address");
+
+        governors[initialGovernor] = true;
+        governorList.push(initialGovernor);
+
+        emit GovernorAdded(initialGovernor, msg.sender);
+    }
+
+    function _countProposalsByGovernor(
+        address governor
+    ) internal view returns (uint256) {
+        return governorProposals[governor].length;
+    }
+
+    function _countApprovalsByGovernor(
+        address governor
+    ) internal view returns (uint256) {
+        return governorApprovalCount[governor];
     }
 }
