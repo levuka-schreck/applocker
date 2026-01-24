@@ -1,79 +1,72 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
 
 /**
  * @title LPToken
- * @dev Represents shares in the Payments Vault
+ * @notice LP Token for the AppEx Payments Vault
+ * @dev Minted when users deposit USDC, burned on withdrawal
  */
-contract LPToken is ERC20, Ownable, Pausable {
-
+contract LPToken is ERC20, Ownable {
     address public vault;
-    uint256 public renounceTimestamp;
-    uint256 constant RENOUNCE_DELAY = 7 days;
-    
-    event VaultSet(address vault, address sender);
-    event InitiateRenounce(uint256 timestamp);
-    event ConfirmRenounce(uint256 timestamp);
+
+    error OnlyVault();
+    error ZeroAddress();
+    error VaultAlreadySet();
 
     modifier onlyVault() {
-        require(msg.sender == vault, "Only vault can call");
+        if (msg.sender != vault) revert OnlyVault();
         _;
     }
 
+    /**
+     * @notice Constructor
+     * @param _name Token name
+     * @param _symbol Token symbol
+     */
     constructor(
-        string memory name, 
-        string memory symbol,
-        address _vault
-    ) ERC20(name, symbol) Ownable(msg.sender) {
-        require(_vault != address(0), "Vault cannot be zero");
-        require(_vault.code.length > 0, "Vault must be contract");
-        vault = _vault;
-        emit VaultSet(_vault, msg.sender);
+        string memory _name,
+        string memory _symbol
+    ) ERC20(_name, _symbol) Ownable(msg.sender) {
+        // Vault will be set via setVault() after deployment
     }
 
+    /**
+     * @notice Set the vault address (can only be called once by owner)
+     * @param _vault Address of the PaymentsVault
+     */
     function setVault(address _vault) external onlyOwner {
-        require(vault == address(0), "Vault already set");
-        require(_vault != address(0), "Vault cannot be zero address");
-        require(_vault.code.length > 0, "Vault must be a contract");
+        if (_vault == address(0)) revert ZeroAddress();
+        if (vault != address(0)) revert VaultAlreadySet();
         vault = _vault;
-        emit VaultSet(_vault, msg.sender);
+        // Transfer ownership to the vault
+        _transferOwnership(_vault);
     }
 
+    /**
+     * @notice Mint LP tokens to an address
+     * @param to Recipient address
+     * @param amount Amount to mint
+     */
     function mint(address to, uint256 amount) external onlyVault {
         _mint(to, amount);
     }
 
+    /**
+     * @notice Burn LP tokens from an address
+     * @param from Address to burn from
+     * @param amount Amount to burn
+     */
     function burn(address from, uint256 amount) external onlyVault {
-        require(from == msg.sender || allowance(from, vault) >= amount, 
-            "Burn not authorized");
-        
-        if(from != msg.sender) {
-            _spendAllowance(from, vault, amount);
-        }
         _burn(from, amount);
     }
 
-    function pause() external onlyOwner {
-        _pause();
+    /**
+     * @notice Returns the number of decimals (matches USDC)
+     */
+    function decimals() public pure override returns (uint8) {
+        return 6;
     }
-    
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-    
-    function initiateRenounce() external onlyOwner {
-        renounceTimestamp = block.timestamp + RENOUNCE_DELAY;
-        emit InitiateRenounce(renounceTimestamp);
-
-    }
-    
-    function confirmRenounce() external onlyOwner {
-        require(block.timestamp >= renounceTimestamp, "Delay not met");
-        _transferOwnership(address(0));
-        emit ConfirmRenounce(block.timestamp);
-    }       
 }

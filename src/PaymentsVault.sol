@@ -184,7 +184,7 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         require(_appexToken != address(0), "Invalid APPEX address");
         usdc = IERC20(_usdc);
         appexToken = AppExToken(_appexToken);
-        lpToken = new LPToken(lpName, lpSymbol, address(this));
+        lpToken = new LPToken(lpName, lpSymbol);
         lastNAVUpdate = block.timestamp;
         lpToken.setVault(address(this));
     }
