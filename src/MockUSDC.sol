@@ -28,9 +28,17 @@ contract MockUSDC is ERC20, Ownable {
     }
 
     /**
-     * @dev Faucet function for testing - anyone can get 50,000 USDC
+     * @dev Faucet function for testing - anyone can get 250,000 USDC
      */
     function faucet() external {
-        _mint(msg.sender, 50000 * 10**_decimals);
+        _mint(msg.sender, 250_000 * 10**_decimals);
+    }
+
+    /**
+     * @notice Burn tokens from caller
+     * @param amount Amount of tokens to burn
+     */
+    function burn(uint256 amount) external {
+        _burn(msg.sender, amount);
     }
 }

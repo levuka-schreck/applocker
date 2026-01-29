@@ -25,6 +25,10 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
     mapping(address => bytes32[]) public governorProposals; // Proposals created by each governor
     mapping(address => uint256) public governorApprovalCount; // Approvals made by each governor
 
+    // Multi-Admin System
+    mapping(address => bool) public admins;
+    address[] public adminList;
+
     // Tokens
     IERC20 public immutable usdc;
     AppExToken public immutable appexToken;
@@ -144,6 +148,11 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         uint256 approvalCount;
     }
 
+    struct AdminDetails {
+        address adminAddress;
+        bool isActive;
+    }
+
     // Events
     event RedemptionRequested(address indexed lp, uint256 amount);
     event Redeemed(address indexed lp, uint256 lpTokens, uint256 usdc);
@@ -161,6 +170,8 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
     event Deposited(address indexed lp, uint256 amount, uint256 lpTokens);
     event GovernorAdded(address indexed governor, address indexed addedBy);
     event GovernorRemoved(address indexed governor, address indexed removedBy);
+    event AdminAdded(address indexed admin, address indexed addedBy);
+    event AdminRemoved(address indexed admin, address indexed removedBy);
     event TimelockSet(address indexed timelock);
     event BorrowerProposed(bytes32 proposalId, address borrower, uint256 limit);
     event BorrowerProposalApproved(
@@ -168,6 +179,14 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         address approver,
         uint256 approvals
     );
+
+    modifier onlyAdmin() {
+        require(
+            msg.sender == owner() || admins[msg.sender],
+            "Caller is not an admin"
+        );
+        _;
+    }
 
     modifier onlyGovernor() {
         require(governors[msg.sender], "Caller is not a governor");
@@ -187,6 +206,108 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         lpToken = new LPToken(lpName, lpSymbol);
         lastNAVUpdate = block.timestamp;
         lpToken.setVault(address(this));
+    }
+
+    // ==================== Admin Management Functions ====================
+
+    /**
+     * @dev Add a new admin (only owner can add admins)
+     * @param admin Address to grant admin privileges
+     */
+    function addAdmin(address admin) external onlyOwner {
+        require(admin != address(0), "Invalid admin address");
+        require(!admins[admin], "Already an admin");
+        require(admin != owner(), "Owner is already admin");
+
+        admins[admin] = true;
+        adminList.push(admin);
+
+        emit AdminAdded(admin, msg.sender);
+    }
+
+    /**
+     * @dev Remove an admin (only owner can remove admins)
+     * @param admin Address to revoke admin privileges from
+     */
+    function removeAdmin(address admin) external onlyOwner {
+        require(admins[admin], "Not an admin");
+
+        admins[admin] = false;
+
+        // Remove from adminList array
+        for (uint256 i = 0; i < adminList.length; i++) {
+            if (adminList[i] == admin) {
+                adminList[i] = adminList[adminList.length - 1];
+                adminList.pop();
+                break;
+            }
+        }
+
+        emit AdminRemoved(admin, msg.sender);
+    }
+
+    /**
+     * @dev Check if an address is an admin (public view)
+     * @param account Address to check
+     * @return bool True if the address is an admin or owner
+     */
+    function isAdmin(address account) external view returns (bool) {
+        return account == owner() || admins[account];
+    }
+
+    /**
+     * @dev Get the total count of admins (excluding owner)
+     * @return count Number of admins
+     */
+    function getAdminCount() public view returns (uint256) {
+        return adminList.length;
+    }
+
+    /**
+     * @dev Get list of all admins (public view)
+     * @return addresses Array of all admin addresses
+     * @return count Total number of admins
+     */
+    function getListOfAdmins()
+        external
+        view
+        returns (address[] memory addresses, uint256 count)
+    {
+        count = adminList.length;
+        addresses = new address[](count);
+
+        for (uint256 i = 0; i < count; i++) {
+            addresses[i] = adminList[i];
+        }
+    }
+
+    /**
+     * @dev Get detailed information about all admins
+     * @return addresses Array of admin addresses
+     * @return adminDetails Array of detailed admin information
+     * @return count Total number of admins
+     */
+    function getAdminsDetails()
+        external
+        view
+        returns (
+            address[] memory addresses,
+            AdminDetails[] memory adminDetails,
+            uint256 count
+        )
+    {
+        count = adminList.length;
+        addresses = new address[](count);
+        adminDetails = new AdminDetails[](count);
+
+        for (uint256 i = 0; i < count; i++) {
+            address adm = adminList[i];
+            addresses[i] = adm;
+            adminDetails[i] = AdminDetails({
+                adminAddress: adm,
+                isActive: admins[adm]
+            });
+        }
     }
 
     // ==================== LP Functions ====================
@@ -287,14 +408,14 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
     // ==================== Borrower Functions ====================
 
     /**
-     * @dev Approve a borrower
+     * @dev Approve a borrower (admin or owner can approve)
      */
     function approveBorrower(
         address borrower,
         uint256 limit,
         uint256 lpYieldRate,
         uint256 protocolFeeRate
-    ) external onlyOwner {
+    ) external onlyAdmin {
         require(borrower != address(0), "Invalid borrower address");
         require(!borrowers[borrower].approved, "Already approved");
 
@@ -658,33 +779,31 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
             uint256 totalLoans
         )
     {
-        totalLoans = nextLoanId - 1; // Total loans created (IDs start at 1)
+        totalLoans = nextLoanId - 1; // Since nextLoanId starts at 1
 
-        // Determine how many loans to return
-        uint256 endIndex;
-        if (count == 0 || startIndex + count > totalLoans) {
-            endIndex = totalLoans;
-        } else {
-            endIndex = startIndex + count;
+        if (startIndex >= totalLoans) {
+            return (new uint256[](0), new LoanDetails[](0), totalLoans);
         }
 
-        // Ensure startIndex is valid
-        require(
-            startIndex > 0 && startIndex <= totalLoans,
-            "Invalid start index"
-        );
+        uint256 endIndex = count == 0
+            ? totalLoans
+            : (
+                startIndex + count > totalLoans
+                    ? totalLoans
+                    : startIndex + count
+            );
+        uint256 resultCount = endIndex - startIndex;
 
-        uint256 resultCount = endIndex - startIndex + 1;
         loanIds = new uint256[](resultCount);
         loanDetails = new LoanDetails[](resultCount);
 
-        uint256 resultIndex = 0;
-        for (uint256 i = startIndex; i <= endIndex; i++) {
-            Loan memory loan = loans[i];
+        for (uint256 i = 0; i < resultCount; i++) {
+            uint256 loanId = startIndex + i + 1; // Loan IDs start at 1
+            Loan memory loan = loans[loanId];
 
-            loanIds[resultIndex] = i;
-            loanDetails[resultIndex] = LoanDetails({
-                loanId: i,
+            loanIds[i] = loanId;
+            loanDetails[i] = LoanDetails({
+                loanId: loanId,
                 borrower: loan.borrower,
                 publisher: loan.publisher,
                 principal: loan.principal,
@@ -695,59 +814,160 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
                 termDays: loan.termDays,
                 endTime: loan.startTime + (loan.termDays * 1 days),
                 repaid: loan.repaid,
-                daysElapsed: loan.repaid
-                    ? 0
-                    : (block.timestamp - loan.startTime) / 1 days,
-                isOverdue: !loan.repaid &&
-                    block.timestamp >
-                    (loan.startTime + (loan.termDays * 1 days)),
+                daysElapsed: (block.timestamp - loan.startTime) / 1 days,
+                isOverdue: block.timestamp >
+                    loan.startTime + (loan.termDays * 1 days) &&
+                    !loan.repaid,
                 accruedFees: _calculateAccruedFees(loan)
             });
-
-            resultIndex++;
         }
     }
 
     /**
-     * @dev Get comprehensive list of all approved borrowers (admin only)
-     * @return borrowerAddresses Array of borrower addresses
-     * @return borrowerDetails Array of borrower information
-     * @return totalBorrowers Total number of borrowers
+     * @dev Get only active (unpaid) loans
+     * @return loanIds Array of active loan IDs
+     * @return loanDetails Array of loan information for active loans
+     * @return count Number of active loans
+     */
+    function getActiveLoans()
+        external
+        view
+        returns (
+            uint256[] memory loanIds,
+            LoanDetails[] memory loanDetails,
+            uint256 count
+        )
+    {
+        count = activeLoans.length;
+        loanIds = new uint256[](count);
+        loanDetails = new LoanDetails[](count);
+
+        for (uint256 i = 0; i < count; i++) {
+            uint256 loanId = activeLoans[i];
+            Loan memory loan = loans[loanId];
+
+            loanIds[i] = loanId;
+            loanDetails[i] = LoanDetails({
+                loanId: loanId,
+                borrower: loan.borrower,
+                publisher: loan.publisher,
+                principal: loan.principal,
+                lpFee: loan.lpFee,
+                protocolFee: loan.protocolFee,
+                totalDue: loan.principal + loan.lpFee + loan.protocolFee,
+                startTime: loan.startTime,
+                termDays: loan.termDays,
+                endTime: loan.startTime + (loan.termDays * 1 days),
+                repaid: loan.repaid,
+                daysElapsed: (block.timestamp - loan.startTime) / 1 days,
+                isOverdue: block.timestamp >
+                    loan.startTime + (loan.termDays * 1 days),
+                accruedFees: _calculateAccruedFees(loan)
+            });
+        }
+    }
+
+    /**
+     * @dev Get loans for a specific borrower
+     * @param borrowerAddr The borrower's address
+     * @return loanIds Array of loan IDs for this borrower
+     * @return loanDetails Array of loan information
+     * @return count Number of loans found
+     */
+    function getLoansByBorrower(
+        address borrowerAddr
+    )
+        external
+        view
+        returns (
+            uint256[] memory loanIds,
+            LoanDetails[] memory loanDetails,
+            uint256 count
+        )
+    {
+        // First, count loans for this borrower
+        uint256 totalLoans = nextLoanId - 1;
+        uint256 borrowerLoanCount = 0;
+
+        for (uint256 i = 1; i <= totalLoans; i++) {
+            if (loans[i].borrower == borrowerAddr) {
+                borrowerLoanCount++;
+            }
+        }
+
+        loanIds = new uint256[](borrowerLoanCount);
+        loanDetails = new LoanDetails[](borrowerLoanCount);
+        count = borrowerLoanCount;
+
+        uint256 resultIndex = 0;
+        for (uint256 i = 1; i <= totalLoans && resultIndex < borrowerLoanCount; i++) {
+            Loan memory loan = loans[i];
+            if (loan.borrower == borrowerAddr) {
+                loanIds[resultIndex] = i;
+                loanDetails[resultIndex] = LoanDetails({
+                    loanId: i,
+                    borrower: loan.borrower,
+                    publisher: loan.publisher,
+                    principal: loan.principal,
+                    lpFee: loan.lpFee,
+                    protocolFee: loan.protocolFee,
+                    totalDue: loan.principal + loan.lpFee + loan.protocolFee,
+                    startTime: loan.startTime,
+                    termDays: loan.termDays,
+                    endTime: loan.startTime + (loan.termDays * 1 days),
+                    repaid: loan.repaid,
+                    daysElapsed: (block.timestamp - loan.startTime) / 1 days,
+                    isOverdue: block.timestamp >
+                        loan.startTime + (loan.termDays * 1 days) &&
+                        !loan.repaid,
+                    accruedFees: _calculateAccruedFees(loan)
+                });
+                resultIndex++;
+            }
+        }
+    }
+
+    /**
+     * @dev Get comprehensive list of all borrowers with their details
+     * @return addresses Array of borrower addresses
+     * @return borrowerDetails Array of detailed borrower information
+     * @return count Total number of borrowers
      */
     function getListOfBorrowers()
         external
         view
-        onlyOwner
         returns (
-            address[] memory borrowerAddresses,
+            address[] memory addresses,
             BorrowerDetails[] memory borrowerDetails,
-            uint256 totalBorrowers
+            uint256 count
         )
     {
-        totalBorrowers = borrowerList.length;
-        borrowerAddresses = new address[](totalBorrowers);
-        borrowerDetails = new BorrowerDetails[](totalBorrowers);
+        count = borrowerList.length;
+        addresses = new address[](count);
+        borrowerDetails = new BorrowerDetails[](count);
 
-        for (uint256 i = 0; i < totalBorrowers; i++) {
+        for (uint256 i = 0; i < count; i++) {
             address borrowerAddr = borrowerList[i];
-            Borrower memory borrower = borrowers[borrowerAddr];
+            Borrower memory b = borrowers[borrowerAddr];
 
-            borrowerAddresses[i] = borrowerAddr;
+            uint256 availableCredit = b.borrowLimit > b.currentDebt
+                ? b.borrowLimit - b.currentDebt
+                : 0;
+            uint256 utilizationRate = b.borrowLimit > 0
+                ? (b.currentDebt * BASIS_POINTS) / b.borrowLimit
+                : 0;
+
+            addresses[i] = borrowerAddr;
             borrowerDetails[i] = BorrowerDetails({
                 borrowerAddress: borrowerAddr,
-                approved: borrower.approved,
-                borrowLimit: borrower.borrowLimit,
-                currentDebt: borrower.currentDebt,
-                availableCredit: borrower.borrowLimit > borrower.currentDebt
-                    ? borrower.borrowLimit - borrower.currentDebt
-                    : 0,
-                utilizationRate: borrower.borrowLimit > 0
-                    ? (borrower.currentDebt * BASIS_POINTS) /
-                        borrower.borrowLimit
-                    : 0,
-                lpYieldRate: borrower.lpYieldRate,
-                protocolFeeRate: borrower.protocolFeeRate,
-                totalFeeRate: borrower.lpYieldRate + borrower.protocolFeeRate,
+                approved: b.approved,
+                borrowLimit: b.borrowLimit,
+                currentDebt: b.currentDebt,
+                availableCredit: availableCredit,
+                utilizationRate: utilizationRate,
+                lpYieldRate: b.lpYieldRate,
+                protocolFeeRate: b.protocolFeeRate,
+                totalFeeRate: b.lpYieldRate + b.protocolFeeRate,
                 activeLoanCount: _countActiveLoansByBorrower(borrowerAddr)
             });
         }
@@ -755,8 +975,6 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
 
     /**
      * @dev Helper function to calculate accrued fees for a loan
-     * @param loan The loan to calculate fees for
-     * @return accruedFees The amount of fees accrued so far
      */
     function _calculateAccruedFees(
         Loan memory loan
