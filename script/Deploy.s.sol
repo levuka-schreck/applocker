@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.20;
 
 import "forge-std/Script.sol";
 import "../src/MockUSDC.sol";
@@ -9,6 +9,11 @@ import "../src/PaymentsVault.sol";
 contract DeployAppEx is Script {
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
+
+        address admin2 = vm.envOr("ADMIN_2", address(0));
+        address admin3 = vm.envOr("ADMIN_3", address(0));
+        address governor1 = vm.envOr("GOVERNOR_1", address(0));        
+        
         address deployer = vm.addr(deployerPrivateKey);
 
         console.log("Deploying contracts with address:", deployer);
@@ -45,26 +50,57 @@ contract DeployAppEx is Script {
         console.log("Test borrower approved:", deployer);
 
         // Mint test USDC to deployer
-        usdc.mint(deployer, 10000000 * 10**6); // 10M USDC
+        usdc.mint(deployer, 10_000_000 * 10**6); // 10M USDC
         console.log("Minted 10M USDC to deployer");
+
+        address[] memory proposers = new address[](1);
+        address[] memory executors = new address[](1);
+        
+        // The vault contract will be the proposer/executor
+        // Set to address(0) for executor to allow anyone to execute after delay
+        proposers[0] = address(vault);
+        executors[0] = address(0);
+        
+        // 1 day delay (86400 seconds) - adjust as needed
+        TimelockController timelock = new TimelockController(
+            600,      // minDelay
+            proposers,  // proposers
+            executors,  // executors  
+            msg.sender  // admin
+        );
+
+        console.log("Timelock deployed at:", address(timelock));
+
+        // Add additional admins if specified
+        if (admin2 != address(0)) {
+            vault.addAdmin(admin2);
+            console.log("Added admin:", admin2);
+        }
+        if (admin3 != address(0)) {
+            vault.addAdmin(admin3);
+            console.log("Added admin:", admin3);
+        }
+
+        // Initialize governor if specified
+        if (governor1 != address(0)) {
+            vault.initializeGovernor(governor1);
+            console.log("Initialized governor:", governor1);
+        }
 
         vm.stopBroadcast();
 
         // Output deployment addresses
         console.log("\n========================================");
-        console.log("DEPLOYMENT ADDRESSES");
-        console.log("========================================");
-        console.log("USDC:", address(usdc));
-        console.log("APPEX:", address(appex));
-        console.log("VAULT:", address(vault));
-        console.log("LP_TOKEN:", address(vault.lpToken()));
-        console.log("========================================");
-        console.log("\nAdd these to frontend/.env:");
-        console.log("========================================");
-        console.log("VITE_USDC_ADDRESS=%s", address(usdc));
-        console.log("VITE_APPEX_ADDRESS=%s", address(appex));
-        console.log("VITE_VAULT_ADDRESS=%s", address(vault));
-        console.log("========================================");
+        console.log("\nDEPLOYMENT ADDRESSES");
+        console.log("\n========================================");
+        console.log("\nNEXT_PUBLIC_USDC_ADDRESS=",address(usdc));
+        console.log("\nNEXT_PUBLIC_APPEX_TOKEN_ADDRESS=",address(appex));
+        console.log("\nNEXT_PUBLIC_PAYMENTS_VAULT_ADDRESS=",address(vault));
+        console.log("\nNEXT_PUBLIC_LP_TOKEN_ADDRESS=",address(vault.lpToken()));
+        console.log("\nTIMELOCK=",address(timelock));
+        console.log("\n========================================");
+        console.log("\nAdd the NEXT envs to frontend/.env, and timelock used in UI.");
+        console.log("\n========================================");
     }
 
     function setupAllocations(
