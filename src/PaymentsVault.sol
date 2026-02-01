@@ -36,8 +36,11 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
 
     // Vault state
     uint256 public totalDeposits;
-    uint256 public totalLoansOutstanding;
-    uint256 public totalAccruedFees;
+    uint256 public totalLoansOutstanding;      // Total principal owed by borrowers
+    uint256 public totalAppexFundedLoans;      // Portion of loans funded by borrower's APPEX (not vault USDC)
+    uint256 public totalAccruedFees;           // Pending fees on active loans (calculated by updateNAV)
+    uint256 public totalCollectedFees;         // Realized LP fees that have been paid
+    uint256 public totalProtocolFees;          // Protocol fees + APPEX-converted amounts
     uint256 public lastNAVUpdate;
 
     // Parameters
@@ -53,6 +56,9 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         uint256 currentDebt;
         uint256 lpYieldRate; // basis points per loan
         uint256 protocolFeeRate; // basis points per loan
+        uint256 totalBorrowed; // Lifetime total borrowed
+        uint256 totalRepaid;   // Lifetime total repaid (principal only)
+        uint256 totalFeesPaid; // Lifetime fees paid
     }
     mapping(address => Borrower) public borrowers;
     address[] public borrowerList;
@@ -66,8 +72,10 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         uint256 protocolFee;
         uint256 startTime;
         uint256 termDays;
-        bool repaid;
+        bool repaid;           // Principal has been repaid
+        bool protocolFeePaid;  // Protocol fee has been paid
         uint256 dailyAccrual;
+        uint256 usdcPrincipal; // Actual USDC sent (may be less than principal if APPEX split)
     }
     mapping(uint256 => Loan) public loans;
     uint256 public nextLoanId = 1;
@@ -113,6 +121,7 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         address borrower;
         address publisher;
         uint256 principal;
+        uint256 usdcPrincipal;  // Actual USDC sent (may be less if APPEX split)
         uint256 lpFee;
         uint256 protocolFee;
         uint256 totalDue;
@@ -120,6 +129,7 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         uint256 termDays;
         uint256 endTime;
         bool repaid;
+        bool protocolFeePaid;
         uint256 daysElapsed;
         bool isOverdue;
         uint256 accruedFees;
@@ -139,6 +149,9 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         uint256 protocolFeeRate;
         uint256 totalFeeRate;
         uint256 activeLoanCount;
+        uint256 totalBorrowed;
+        uint256 totalRepaid;
+        uint256 totalFeesPaid;
     }
 
     struct GovernorDetails {
@@ -164,6 +177,8 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         uint256 amount
     );
     event LoanRepaid(uint256 indexed loanId, uint256 principal, uint256 fees);
+    event ProtocolFeePaid(uint256 indexed loanId, uint256 feeAmount, bool paidInAppex);
+    event ProtocolFeesWithdrawn(address indexed recipient, uint256 amount);
     event Staked(address indexed lp, uint256 amount, uint256 duration);
     event Unstaked(address indexed lp, uint256 amount);
     event RewardsDistributed(uint256 amount);
@@ -184,6 +199,14 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         require(
             msg.sender == owner() || admins[msg.sender],
             "Caller is not an admin"
+        );
+        _;
+    }
+
+    modifier onlyAdminOrGovernor() {
+        require(
+            msg.sender == owner() || admins[msg.sender] || governors[msg.sender],
+            "Caller is not an admin or governor"
         );
         _;
     }
@@ -320,16 +343,21 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
 
         updateNAV();
 
-        totalDeposits += amount;
-
         uint256 lpTokensToMint;
         uint256 currentSupply = lpToken.totalSupply();
 
         if (currentSupply == 0) {
-            lpTokensToMint = amount * 10 ** 12;
+            // First deposit: 1:1 ratio (both USDC and LP tokens have 6 decimals)
+            lpTokensToMint = amount;
         } else {
+            // Subsequent deposits: proportional to current NAV
+            // Both amount and getNAV() are in 6 decimals (USDC)
+            // currentSupply is in 6 decimals (LP tokens)
             lpTokensToMint = (amount * currentSupply) / getNAV();
         }
+
+        // Update NAV tracking AFTER calculating LP tokens to mint
+        totalDeposits += amount;
 
         usdc.safeTransferFrom(msg.sender, address(this), amount);
         lpToken.mint(msg.sender, lpTokensToMint);
@@ -424,7 +452,10 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
             borrowLimit: limit,
             currentDebt: 0,
             lpYieldRate: lpYieldRate,
-            protocolFeeRate: protocolFeeRate
+            protocolFeeRate: protocolFeeRate,
+            totalBorrowed: 0,
+            totalRepaid: 0,
+            totalFeesPaid: 0
         });
 
         borrowerList.push(borrower);
@@ -458,6 +489,12 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         uint256 protocolFee = (principal * borrower.protocolFeeRate) /
             BASIS_POINTS;
 
+        // Calculate USDC vs APPEX split
+        uint256 appexFundedAmount = (payInAppEx && appexPercentage > 0) 
+            ? (principal * appexPercentage) / 100 
+            : 0;
+        uint256 usdcFundedAmount = principal - appexFundedAmount;
+
         uint256 loanId = nextLoanId++;
 
         loans[loanId] = Loan({
@@ -469,27 +506,25 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
             startTime: block.timestamp,
             termDays: termDays,
             repaid: false,
-            dailyAccrual: lpFee / termDays
+            protocolFeePaid: false,
+            dailyAccrual: lpFee / termDays,
+            usdcPrincipal: usdcFundedAmount  // Track USDC portion for repayment accounting
         });
 
         activeLoans.push(loanId);
-        borrower.currentDebt += principal;
-        totalLoansOutstanding += principal;
+        borrower.currentDebt += principal;           // Borrower owes full principal
+        borrower.totalBorrowed += principal;         // Track full amount borrowed
+        totalLoansOutstanding += principal;          // Full principal is "outstanding"
+        totalAppexFundedLoans += appexFundedAmount;  // But this portion wasn't funded by vault USDC
 
         // Handle payment to publisher
-        if (payInAppEx && appexPercentage > 0) {
-            uint256 appexAmount = (principal * appexPercentage) / 100;
-            uint256 usdcAmount = principal - appexAmount;
-
-            if (usdcAmount > 0) {
-                usdc.safeTransfer(publisher, usdcAmount);
+        if (appexFundedAmount > 0) {
+            if (usdcFundedAmount > 0) {
+                usdc.safeTransfer(publisher, usdcFundedAmount);
             }
-
-            if (appexAmount > 0) {
-                // In production, this would buy APPEX from DEX
-                // For demo, direct transfer
-                appexToken.transfer(publisher, appexAmount * 10 ** 12); // Adjust for decimals
-            }
+            // In production, this would buy APPEX from DEX
+            // For demo, transfer APPEX from vault's holdings
+            appexToken.transfer(publisher, appexFundedAmount * 10 ** 12); // Adjust for decimals
         } else {
             usdc.safeTransfer(publisher, principal);
         }
@@ -500,35 +535,85 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @dev Repay a loan
+     * @dev Repay a loan (principal + LP fee)
      */
-    function repayLoan(
-        uint256 loanId,
-        bool payFeeInAppEx
-    ) external nonReentrant {
+    function repayLoan(uint256 loanId) external nonReentrant {
         Loan storage loan = loans[loanId];
         require(!loan.repaid, "Already repaid");
         require(loan.borrower == msg.sender, "Not loan borrower");
 
         updateNAV();
 
-        uint256 totalDue = loan.principal + loan.lpFee + loan.protocolFee;
+        // Borrower pays back full principal + LP fee in USDC
         uint256 usdcAmount = loan.principal + loan.lpFee;
-        uint256 appexFeeAmount = 0;
-
-        if (payFeeInAppEx) {
-            uint256 discountedFee = (loan.protocolFee * 75) / 100;
-            appexFeeAmount = discountedFee * 10 ** 12;
-        } else {
-            usdcAmount = totalDue;
-        }
 
         loan.repaid = true;
         borrowers[msg.sender].currentDebt -= loan.principal;
-        totalLoansOutstanding -= loan.principal;
-        totalAccruedFees += loan.lpFee;
+        borrowers[msg.sender].totalRepaid += loan.principal;
+        
+        // Calculate APPEX-funded portion
+        uint256 appexFundedPortion = loan.principal - loan.usdcPrincipal;
+        
+        // Update loan tracking
+        totalLoansOutstanding -= loan.principal;         // Reduce by full principal
+        totalAppexFundedLoans -= appexFundedPortion;     // Remove APPEX-funded tracking
+        
+        // LP fee goes to collected fees (LP earnings)
+        totalCollectedFees += loan.lpFee;
+        
+        // The APPEX-funded portion was paid by borrower's APPEX, not vault USDC.
+        // When repaid in USDC, this "conversion" goes to protocol, not LPs.
+        if (appexFundedPortion > 0) {
+            totalProtocolFees += appexFundedPortion;
+        }
 
-        // Remove from active loans
+        // Only remove from active loans if both principal AND protocol fee are paid
+        if (loan.protocolFeePaid) {
+            _removeFromActiveLoans(loanId);
+        }
+
+        usdc.safeTransferFrom(msg.sender, address(this), usdcAmount);
+
+        emit LoanRepaid(loanId, loan.principal, loan.lpFee);
+    }
+
+    /**
+     * @dev Pay protocol fee for a loan (can use APPEX for 25% discount)
+     */
+    function payProtocolFee(uint256 loanId, bool payInAppex) external nonReentrant {
+        Loan storage loan = loans[loanId];
+        require(!loan.protocolFeePaid, "Protocol fee already paid");
+        require(loan.borrower == msg.sender, "Not loan borrower");
+
+        loan.protocolFeePaid = true;
+        borrowers[msg.sender].totalFeesPaid += loan.protocolFee;
+
+        if (payInAppex) {
+            // 25% discount when paying in APPEX
+            uint256 discountedFee = (loan.protocolFee * 75) / 100;
+            // Scale from 6 decimals (USDC) to 18 decimals (APPEX)
+            uint256 appexAmount = discountedFee * 10 ** 12;
+            appexToken.transferFrom(msg.sender, address(this), appexAmount);
+            distributeAppExFees(appexAmount);
+            // Track discounted amount in USDC terms
+            totalProtocolFees += discountedFee;
+        } else {
+            usdc.safeTransferFrom(msg.sender, address(this), loan.protocolFee);
+            totalProtocolFees += loan.protocolFee;
+        }
+
+        // Remove from active loans if principal is also repaid
+        if (loan.repaid) {
+            _removeFromActiveLoans(loanId);
+        }
+
+        emit ProtocolFeePaid(loanId, loan.protocolFee, payInAppex);
+    }
+
+    /**
+     * @dev Internal function to remove loan from active loans array
+     */
+    function _removeFromActiveLoans(uint256 loanId) internal {
         for (uint256 i = 0; i < activeLoans.length; i++) {
             if (activeLoans[i] == loanId) {
                 activeLoans[i] = activeLoans[activeLoans.length - 1];
@@ -536,21 +621,14 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
                 break;
             }
         }
-
-        usdc.safeTransferFrom(msg.sender, address(this), usdcAmount);
-
-        if (payFeeInAppEx) {
-            appexToken.transferFrom(msg.sender, address(this), appexFeeAmount);
-            distributeAppExFees(appexFeeAmount);
-        }
-
-        emit LoanRepaid(loanId, loan.principal, loan.lpFee + loan.protocolFee);
     }
 
     // ==================== Staking Functions ====================
 
     /**
      * @dev Stake APPEX tokens
+     * Note: LP tokens have 6 decimals, APPEX has 18 decimals
+     * Staking cap is based on LP token holdings scaled to APPEX decimals
      */
     function stake(uint256 amount, uint256 lockDays) external nonReentrant {
         require(
@@ -559,8 +637,10 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         );
         require(amount > 0, "Amount must be > 0");
 
-        uint256 lpBalance = lpToken.balanceOf(msg.sender);
-        uint256 maxStake = (lpBalance * stakingMultiplier) / 100;
+        uint256 lpBalance = lpToken.balanceOf(msg.sender);  // 6 decimals
+        // Scale LP balance (6 decimals) to APPEX scale (18 decimals) for comparison
+        // maxStake = lpBalance * 10^12 * stakingMultiplier / 100
+        uint256 maxStake = (lpBalance * stakingMultiplier * 10**12) / 100;
 
         StakingPosition storage position = stakingPositions[msg.sender];
         require(
@@ -611,19 +691,57 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
     // ==================== View Functions ====================
 
     /**
-     * @dev Get current NAV
+     * @dev Get current NAV (Net Asset Value for LPs)
+     * NAV = LP's USDC + USDC-funded loans outstanding + Pending LP Fees
+     * 
+     * IMPORTANT: Only counts loans funded by vault USDC, not APPEX portions.
+     * Protocol fees and APPEX-converted amounts are excluded (belong to protocol).
      */
     function getNAV() public view returns (uint256) {
-        return totalDeposits + totalLoansOutstanding + totalAccruedFees;
+        uint256 usdcBalance = usdc.balanceOf(address(this));
+        
+        // USDC balance includes protocol fees which don't belong to LPs
+        uint256 lpUsdcBalance = usdcBalance > totalProtocolFees 
+            ? usdcBalance - totalProtocolFees 
+            : 0;
+        
+        // Only count the USDC-funded portion of loans as LP assets
+        // totalAppexFundedLoans represents portions funded by borrower's APPEX, not vault USDC
+        uint256 usdcFundedLoans = totalLoansOutstanding > totalAppexFundedLoans
+            ? totalLoansOutstanding - totalAppexFundedLoans
+            : 0;
+        
+        // NAV = LP's liquid USDC + USDC-funded loans + Pending LP Fees
+        return lpUsdcBalance + usdcFundedLoans + totalAccruedFees;
     }
 
     /**
      * @dev Get available USDC for redemptions/loans
+     * Available = 85% of liquid NAV (NAV minus loans outstanding)
+     * 
+     * This represents what LPs can actually access - the portion of NAV
+     * that isn't tied up in outstanding loans.
      */
     function getAvailableUSDC() public view returns (uint256) {
-        uint256 balance = usdc.balanceOf(address(this));
-        uint256 requiredBuffer = (getNAV() * liquidityBuffer) / BASIS_POINTS;
-        return balance > requiredBuffer ? balance - requiredBuffer : 0;
+        uint256 nav = getNAV();
+        
+        // Liquid portion of NAV = NAV minus ALL outstanding loans
+        // This is what's not locked in loan receivables
+        uint256 liquidNAV = nav > totalLoansOutstanding 
+            ? nav - totalLoansOutstanding 
+            : 0;
+        
+        // Available = liquid NAV minus 15% buffer for redemptions
+        // i.e., 85% of liquid NAV
+        uint256 available = (liquidNAV * (BASIS_POINTS - liquidityBuffer)) / BASIS_POINTS;
+        
+        // Cap at actual LP USDC in vault (can't lend more than we have)
+        uint256 usdcBalance = usdc.balanceOf(address(this));
+        uint256 lpUsdcBalance = usdcBalance > totalProtocolFees 
+            ? usdcBalance - totalProtocolFees 
+            : 0;
+        
+        return available < lpUsdcBalance ? available : lpUsdcBalance;
     }
 
     /**
@@ -706,6 +824,71 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
     }
 
     /**
+     * @dev Get detailed fee breakdown and accounting
+     */
+    function getFeeBreakdown()
+        external
+        view
+        returns (
+            uint256 pendingLPFees,         // Fees accruing on active loans (not yet collected)
+            uint256 collectedLPFees,       // LP fees that have been collected (part of NAV)
+            uint256 collectedProtocolFees, // Protocol fees collected (not part of NAV)
+            uint256 totalLPFees,           // Total LP fees (pending + collected)
+            uint256 vaultUSDCBalance       // Actual USDC in vault
+        )
+    {
+        pendingLPFees = totalAccruedFees;
+        collectedLPFees = totalCollectedFees;
+        collectedProtocolFees = totalProtocolFees;
+        totalLPFees = totalAccruedFees + totalCollectedFees;
+        vaultUSDCBalance = usdc.balanceOf(address(this));
+    }
+
+    /**
+     * @dev Get complete vault accounting breakdown
+     * Useful for verifying all numbers add up correctly
+     */
+    function getAccountingBreakdown()
+        external
+        view
+        returns (
+            uint256 usdcBalance,           // Actual USDC in vault
+            uint256 lpUsdcShare,           // USDC belonging to LPs (balance - protocol fees)
+            uint256 protocolUsdcShare,     // USDC belonging to protocol (withdrawable)
+            uint256 loansOutstanding,      // Total principal owed by borrowers
+            uint256 appexFundedLoans,      // Portion funded by APPEX (not vault USDC)
+            uint256 usdcFundedLoans,       // Portion funded by vault USDC (loansOutstanding - appexFunded)
+            uint256 pendingFees,           // LP fees accruing on active loans
+            uint256 nav,                   // Total NAV (LP value)
+            uint256 availableLiquidity     // What can be used for new loans/redemptions
+        )
+    {
+        usdcBalance = usdc.balanceOf(address(this));
+        protocolUsdcShare = totalProtocolFees;
+        lpUsdcShare = usdcBalance > protocolUsdcShare ? usdcBalance - protocolUsdcShare : 0;
+        loansOutstanding = totalLoansOutstanding;
+        appexFundedLoans = totalAppexFundedLoans;
+        usdcFundedLoans = loansOutstanding > appexFundedLoans ? loansOutstanding - appexFundedLoans : 0;
+        pendingFees = totalAccruedFees;
+        nav = getNAV();
+        availableLiquidity = getAvailableUSDC();
+    }
+
+    /**
+     * @dev Withdraw protocol fees (admin only)
+     * Protocol fees belong to the protocol, not LPs
+     */
+    function withdrawProtocolFees(address recipient, uint256 amount) external onlyAdmin {
+        require(amount <= totalProtocolFees, "Exceeds protocol fees");
+        require(recipient != address(0), "Invalid recipient");
+        
+        totalProtocolFees -= amount;
+        usdc.safeTransfer(recipient, amount);
+        
+        emit ProtocolFeesWithdrawn(recipient, amount);
+    }
+
+    /**
      * @dev Get borrower info
      */
     function getBorrowerInfo(
@@ -753,7 +936,8 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
         uint256 lpBalance = lpToken.balanceOf(account);
 
         staked = position.appexStaked;
-        maxStake = (lpBalance * stakingMultiplier) / 100;
+        // Scale LP balance (6 decimals) to APPEX scale (18 decimals)
+        maxStake = (lpBalance * stakingMultiplier * 10**12) / 100;
         lockEnd = position.lockEnd;
         multiplier = getMultiplier(position.lockDuration);
         pendingRewards = position.pendingRewards;
@@ -807,6 +991,7 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
                 borrower: loan.borrower,
                 publisher: loan.publisher,
                 principal: loan.principal,
+                usdcPrincipal: loan.usdcPrincipal,
                 lpFee: loan.lpFee,
                 protocolFee: loan.protocolFee,
                 totalDue: loan.principal + loan.lpFee + loan.protocolFee,
@@ -814,6 +999,7 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
                 termDays: loan.termDays,
                 endTime: loan.startTime + (loan.termDays * 1 days),
                 repaid: loan.repaid,
+                protocolFeePaid: loan.protocolFeePaid,
                 daysElapsed: (block.timestamp - loan.startTime) / 1 days,
                 isOverdue: block.timestamp >
                     loan.startTime + (loan.termDays * 1 days) &&
@@ -852,6 +1038,7 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
                 borrower: loan.borrower,
                 publisher: loan.publisher,
                 principal: loan.principal,
+                usdcPrincipal: loan.usdcPrincipal,
                 lpFee: loan.lpFee,
                 protocolFee: loan.protocolFee,
                 totalDue: loan.principal + loan.lpFee + loan.protocolFee,
@@ -859,6 +1046,7 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
                 termDays: loan.termDays,
                 endTime: loan.startTime + (loan.termDays * 1 days),
                 repaid: loan.repaid,
+                protocolFeePaid: loan.protocolFeePaid,
                 daysElapsed: (block.timestamp - loan.startTime) / 1 days,
                 isOverdue: block.timestamp >
                     loan.startTime + (loan.termDays * 1 days),
@@ -909,6 +1097,7 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
                     borrower: loan.borrower,
                     publisher: loan.publisher,
                     principal: loan.principal,
+                    usdcPrincipal: loan.usdcPrincipal,
                     lpFee: loan.lpFee,
                     protocolFee: loan.protocolFee,
                     totalDue: loan.principal + loan.lpFee + loan.protocolFee,
@@ -916,6 +1105,7 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
                     termDays: loan.termDays,
                     endTime: loan.startTime + (loan.termDays * 1 days),
                     repaid: loan.repaid,
+                    protocolFeePaid: loan.protocolFeePaid,
                     daysElapsed: (block.timestamp - loan.startTime) / 1 days,
                     isOverdue: block.timestamp >
                         loan.startTime + (loan.termDays * 1 days) &&
@@ -968,7 +1158,10 @@ contract PaymentsVault is Ownable, ReentrancyGuard {
                 lpYieldRate: b.lpYieldRate,
                 protocolFeeRate: b.protocolFeeRate,
                 totalFeeRate: b.lpYieldRate + b.protocolFeeRate,
-                activeLoanCount: _countActiveLoansByBorrower(borrowerAddr)
+                activeLoanCount: _countActiveLoansByBorrower(borrowerAddr),
+                totalBorrowed: b.totalBorrowed,
+                totalRepaid: b.totalRepaid,
+                totalFeesPaid: b.totalFeesPaid
             });
         }
     }
