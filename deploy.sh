@@ -39,13 +39,10 @@ echo ""
 echo "📦 Deploying smart contracts..."
 echo ""
 
-PRIVATE_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-
 forge script script/Deploy.s.sol \
     --rpc-url http://localhost:8545 \
     --private-key $PRIVATE_KEY \
-    --broadcast \
-    -vvv
+    --broadcast
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}❌ Deployment failed${NC}"
@@ -56,48 +53,20 @@ echo ""
 echo -e "${GREEN}✓${NC} Contracts deployed successfully!"
 echo ""
 
-# Check if deployments.txt exists
-if [ ! -f "deployments.txt" ]; then
-    echo -e "${RED}❌ deployments.txt not found${NC}"
-    exit 1
-fi
-
-# Display addresses
-echo "📋 Contract Addresses:"
-echo "======================"
-cat deployments.txt
-echo ""
-
-# Setup frontend
-echo "🎨 Setting up frontend..."
-echo ""
-
-cd frontend
-
-# Install dependencies if needed
-if [ ! -d "node_modules" ]; then
-    echo "Installing frontend dependencies..."
-    npm install
-    echo ""
-fi
-
-echo -e "${GREEN}✓${NC} Frontend setup complete"
-echo ""
-
-# Final instructions
 echo "🎉 Deployment Complete!"
-echo "======================="
-echo ""
-echo "Next steps:"
-echo "1. Start the frontend:"
-echo "   cd frontend && npm run dev"
-echo ""
-echo "2. Open http://localhost:3000 in your browser"
-echo ""
-echo "3. Go to the Setup page and load the deployments.txt file"
-echo ""
-echo "4. Get test USDC from the faucet on the LP Dashboard"
-echo ""
-echo "5. Start testing the protocol!"
-echo ""
-echo -e "${YELLOW}Note:${NC} Contract addresses have been saved to deployments.txt"
+
+#echo "======================="
+#echo ""
+#echo "Next steps:"
+#echo "1. Start the frontend:"
+#echo "   cd frontend && npm run dev"
+#echo ""
+#echo "2. Open http://localhost:3000 in your browser"
+#echo ""
+#echo "3. Go to the Setup page and load the deployments.txt file"
+#echo ""
+#echo "4. Get test USDC from the faucet on the LP Dashboard"
+#echo ""
+#echo "5. Start testing the protocol!"
+#echo ""
+#echo -e "${YELLOW}Note:${NC} Contract addresses have been saved to deployments.txt"
