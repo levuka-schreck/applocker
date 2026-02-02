@@ -4,7 +4,9 @@ pragma solidity 0.8.20;
 import "forge-std/Script.sol";
 import "../src/MockUSDC.sol";
 import "../src/AppExToken.sol";
+import "../src/LPToken.sol";
 import "../src/PaymentsVault.sol";
+import "../src/VaultLens.sol";
 
 contract DeployAppEx is Script {
     function run() external {
@@ -28,14 +30,25 @@ contract DeployAppEx is Script {
         AppExToken appex = new AppExToken();
         console.log("AppExToken deployed at:", address(appex));
 
-        // Deploy Payments Vault
+        // Deploy LP Token
+        LPToken lpToken = new LPToken("AppEx LP Token", "appexLP");
+        console.log("LPToken deployed at:", address(lpToken));
+
+        // Deploy Payments Vault (now takes lpToken address)
         PaymentsVault vault = new PaymentsVault(
             address(usdc),
             address(appex),
-            "AppEx LP Token",
-            "appexLP"
+            address(lpToken)
         );
         console.log("PaymentsVault deployed at:", address(vault));
+
+        // Connect LP Token to Vault
+        lpToken.setVault(address(vault));
+        console.log("LPToken connected to vault");
+
+        // Deploy VaultLens (read-only view functions)
+        VaultLens vaultLens = new VaultLens();
+        console.log("VaultLens deployed at:", address(vaultLens));
 
         // Setup initial allocations
         setupAllocations(appex, vault, deployer);
@@ -53,6 +66,7 @@ contract DeployAppEx is Script {
         usdc.mint(deployer, 10_000_000 * 10**6); // 10M USDC
         console.log("Minted 10M USDC to deployer");
 
+        // Deploy Timelock Controller
         address[] memory proposers = new address[](1);
         address[] memory executors = new address[](1);
         
@@ -61,15 +75,20 @@ contract DeployAppEx is Script {
         proposers[0] = address(vault);
         executors[0] = address(0);
         
-        // 1 day delay (86400 seconds) - adjust as needed
+        // 10 minute delay for testing (600 seconds)
+        // In production, use longer delay like 2 days (172800 seconds)
         TimelockController timelock = new TimelockController(
-            600,      // minDelay
+            600,        // minDelay
             proposers,  // proposers
             executors,  // executors  
             msg.sender  // admin
         );
 
         console.log("Timelock deployed at:", address(timelock));
+
+        // Connect timelock to vault
+        vault.setTimelock(address(timelock));
+        console.log("Timelock connected to vault");
 
         // Add additional admins if specified
         if (admin2 != address(0)) {
@@ -91,16 +110,29 @@ contract DeployAppEx is Script {
 
         // Output deployment addresses
         console.log("\n========================================");
-        console.log("\nDEPLOYMENT ADDRESSES");
+        console.log("         DEPLOYMENT ADDRESSES           ");
+        console.log("========================================\n");
+        
+        console.log("# Add these to frontend/.env.local:\n");
+        console.log("NEXT_PUBLIC_USDC_ADDRESS=", address(usdc));
+        console.log("NEXT_PUBLIC_APPEX_TOKEN_ADDRESS=", address(appex));
+        console.log("NEXT_PUBLIC_PAYMENTS_VAULT_ADDRESS=", address(vault));
+        console.log("NEXT_PUBLIC_LP_TOKEN_ADDRESS=", address(lpToken));
+        console.log("NEXT_PUBLIC_VAULT_LENS_ADDRESS=", address(vaultLens));
+        
+        console.log("\n# Timelock address for governance UI:");
+        console.log("TIMELOCK_ADDRESS=", address(timelock));
+        
         console.log("\n========================================");
-        console.log("\nNEXT_PUBLIC_USDC_ADDRESS=",address(usdc));
-        console.log("\nNEXT_PUBLIC_APPEX_TOKEN_ADDRESS=",address(appex));
-        console.log("\nNEXT_PUBLIC_PAYMENTS_VAULT_ADDRESS=",address(vault));
-        console.log("\nNEXT_PUBLIC_LP_TOKEN_ADDRESS=",address(vault.lpToken()));
-        console.log("\nTIMELOCK=",address(timelock));
-        console.log("\n========================================");
-        console.log("\nAdd the NEXT envs to frontend/.env, and timelock used in UI.");
-        console.log("\n========================================");
+        console.log("           DEPLOYMENT SUMMARY           ");
+        console.log("========================================");
+        console.log("MockUSDC:       ", address(usdc));
+        console.log("AppExToken:     ", address(appex));
+        console.log("LPToken:        ", address(lpToken));
+        console.log("PaymentsVault:  ", address(vault));
+        console.log("VaultLens:      ", address(vaultLens));
+        console.log("Timelock:       ", address(timelock));
+        console.log("========================================\n");
     }
 
     function setupAllocations(
